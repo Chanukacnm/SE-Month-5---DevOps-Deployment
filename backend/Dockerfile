@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- Dependencies stage: production node_modules only ----
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --no-audit --no-fund
 
 # ---- Runtime stage: no npm cache, no dev dependencies, no tests ----
-FROM node:24-alpine AS runtime
+FROM node:26-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000
