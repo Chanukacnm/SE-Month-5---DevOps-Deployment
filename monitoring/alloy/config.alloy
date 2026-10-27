@@ -1,0 +1,52 @@
+// Log aggregation: tail every container in the `adminflow` Compose project via
+// the Docker API, lift the JSON log level into a label, and push to Loki.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+
+  // Only this Compose project, not every container on the Docker host.
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=adminflow"]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  labels        = { project = "adminflow" }
+  forward_to    = [loki.process.json_level.receiver]
+}
+
+// The API logs one JSON object per line; nginx and Postgres log plain text,
+// which passes through unchanged.
+loki.process "json_level" {
+  stage.json {
+    expressions = { level = "level" }
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

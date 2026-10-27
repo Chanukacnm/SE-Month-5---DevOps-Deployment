@@ -1,0 +1,253 @@
+# AdminFlow CI/CD
+#
+#   PR to main      -> test (backend + frontend) -> container smoke test
+#   push develop    -> ... -> build & push images (tag: develop, sha-<commit>)
+#   push main       -> ... -> build & push images (tag: latest, sha-<commit>) -> deploy to production -> verify
+#   manual dispatch -> optional rollback: redeploy an earlier sha-<commit> image without rebuilding
+#
+# Every image is tagged with the commit SHA, so production always runs an exact,
+# tested build and a rollback is just a redeploy of an older tag.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rollback_tag:
+        description: "Redeploy an existing image tag to production (e.g. sha-1a2b3c4). Leave empty to build and deploy HEAD."
+        required: false
+        default: ""
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded PR runs, but never interrupt a production deploy.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  NODE_VERSION: "24"
+
+jobs:
+  backend:
+    name: Backend - lint & test
+    if: inputs.rollback_tag == ''
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: adminflow
+          POSTGRES_PASSWORD: adminflow
+          POSTGRES_DB: adminflow_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U adminflow"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://adminflow:adminflow@localhost:5432/adminflow_test
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - name: Integration tests with coverage
+        run: >-
+          npm run test:coverage --
+          --test-reporter=spec --test-reporter-destination=stdout
+          --test-reporter=lcov --test-reporter-destination=lcov.info
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/lcov.info
+          retention-days: 14
+
+  frontend:
+    name: Frontend - typecheck, test & build
+    if: inputs.rollback_tag == ''
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  smoke:
+    name: Container smoke test (docker compose)
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create CI .env
+        run: |
+          cp .env.example .env
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+          sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
+
+      - name: Build and start the stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Exercise the app through nginx
+        run: |
+          set -euo pipefail
+          BASE=http://localhost:8080
+          curl -fsS "$BASE/healthz"
+          curl -fsS "$BASE/" | grep -q '<div id="root">'
+          curl -fsS "$BASE/users" | grep -q '<div id="root">'   # SPA fallback
+          TOKEN=$(curl -fsS -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+            -d '{"email":"admin@adminflow.io","password":"Admin@123"}' | jq -r .token)
+          curl -fsS "$BASE/api/users?pageSize=5" -H "Authorization: Bearer $TOKEN" | jq -e '.total == 137'
+          curl -fsS "$BASE/api/dashboard" -H "Authorization: Bearer $TOKEN" | jq -e '.metrics | length == 4'
+          curl -fsS http://localhost:3000/health | jq -e '.status == "healthy"'
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  images:
+    name: Build & push ${{ matrix.service }} image
+    needs: smoke
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: APP_VERSION=sha-${{ github.sha }}
+          # Per-service cache scope so the two images don't evict each other's layers.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Deploy to production
+    needs: images
+    # Runs after a push to main, or alone for a manual rollback.
+    if: >-
+      always() &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.images.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.rollback_tag != ''))
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    env:
+      BACKEND_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_BACKEND }}
+      FRONTEND_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_FRONTEND }}
+      API_URL: ${{ vars.API_URL }}
+      PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ inputs.rollback_tag }}"
+          [ -n "$TAG" ] || TAG="sha-${GITHUB_SHA::7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image_prefix=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "Deploying $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check deployment secrets
+        run: |
+          if [ -z "$BACKEND_HOOK" ] || [ -z "$FRONTEND_HOOK" ]; then
+            echo "::error::Set RENDER_DEPLOY_HOOK_BACKEND and RENDER_DEPLOY_HOOK_FRONTEND in the production environment (see docs/DEPLOYMENT.md)."
+            exit 1
+          fi
+
+      # Render starts the new container, waits for its health check to pass,
+      # then switches traffic and drains the old one (zero-downtime, blue-green
+      # style). A failed health check leaves the old version serving.
+      - name: Deploy API
+        run: |
+          IMG=$(jq -rn --arg v "${{ steps.tag.outputs.image_prefix }}/backend:${{ steps.tag.outputs.tag }}" '$v|@uri')
+          curl -fsS -X POST "${BACKEND_HOOK}&imgURL=${IMG}"
+
+      - name: Wait for the new API version to go live
+        run: |
+          EXPECTED="${{ steps.tag.outputs.tag }}"
+          for i in $(seq 1 60); do
+            VERSION=$(curl -fsS "$API_URL/health" | jq -r .version || true)
+            echo "attempt $i: live version=${VERSION:-unreachable}"
+            # APP_VERSION holds the full SHA; the tag holds the short one.
+            case "$VERSION" in "${EXPECTED}"*) exit 0 ;; esac
+            sleep 10
+          done
+          echo "::error::API did not report $EXPECTED within 10 minutes"
+          exit 1
+
+      - name: Deploy frontend
+        run: |
+          IMG=$(jq -rn --arg v "${{ steps.tag.outputs.image_prefix }}/frontend:${{ steps.tag.outputs.tag }}" '$v|@uri')
+          curl -fsS -X POST "${FRONTEND_HOOK}&imgURL=${IMG}"
+
+      - name: Production smoke test
+        run: |
+          set -euo pipefail
+          sleep 60
+          for _ in $(seq 1 30); do
+            curl -fsS "$PRODUCTION_URL/healthz" && break
+            sleep 10
+          done
+          curl -fsS "$PRODUCTION_URL/" | grep -q '<div id="root">'
+          curl -fsS "$PRODUCTION_URL/api/auth/login" -X POST -H 'Content-Type: application/json' \
+            -d '{"email":"admin@adminflow.io","password":"Admin@123"}' | jq -e '.token | length > 0'
+          echo "Production is serving ${{ steps.tag.outputs.tag }}: $PRODUCTION_URL" >> "$GITHUB_STEP_SUMMARY"

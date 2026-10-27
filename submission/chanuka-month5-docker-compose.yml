@@ -1,0 +1,166 @@
+# AdminFlow: React SPA (nginx) -> Express API -> PostgreSQL
+#
+#   cp .env.example .env                        # then set JWT_SECRET and POSTGRES_PASSWORD
+#   docker compose up -d --build                # app on http://localhost:8080
+#   docker compose --profile monitoring up -d   # + Prometheus, Grafana, Loki, Alloy, Alertmanager
+#
+# Networks: `edge` carries browser -> nginx -> API traffic. `data` is internal
+# (no outbound or published ports), so only the API and the exporter reach Postgres.
+
+name: adminflow
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    image: ${REGISTRY_PREFIX:-adminflow}/frontend:${IMAGE_TAG:-local}
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    environment:
+      API_UPSTREAM: http://backend:3000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [edge]
+    restart: unless-stopped
+    logging: *default-logging
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        APP_VERSION: ${IMAGE_TAG:-local}
+    image: ${REGISTRY_PREFIX:-adminflow}/backend:${IMAGE_TAG:-local}
+    # Published on localhost only, for debugging and `npm run dev` in ./frontend.
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-adminflow}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-adminflow}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # nginx is the only proxy in front of the API in this setup.
+      TRUST_PROXY: 1
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [edge, data]
+    restart: unless-stopped
+    stop_grace_period: 15s
+    logging: *default-logging
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-adminflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-adminflow}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [data]
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ---------------- Monitoring (docker compose --profile monitoring up) ----------------
+
+  prometheus:
+    image: prom/prometheus:v3.13.5
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [edge, data]
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.33.1
+    profiles: [monitoring]
+    command: [--config.file=/etc/alertmanager/alertmanager.yml]
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks: [edge]
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.19.1
+    profiles: [monitoring]
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-adminflow}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-adminflow}?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [data]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.6.19
+    profiles: [monitoring]
+    command: [-config.file=/etc/loki/local-config.yaml]
+    volumes:
+      - loki_data:/loki
+    networks: [edge]
+    restart: unless-stopped
+
+  # Tails every container in this Compose project through the Docker API and ships the logs to Loki.
+  alloy:
+    image: grafana/alloy:v1.20.1
+    profiles: [monitoring]
+    command: [run, --server.http.listen-addr=0.0.0.0:12345, --storage.path=/var/lib/alloy/data, /etc/alloy/config.alloy]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+    networks: [edge]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.0.11
+    profiles: [monitoring]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/adminflow.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on: [prometheus, loki]
+    networks: [edge]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+
+networks:
+  edge:
+    driver: bridge
+  data:
+    driver: bridge
+    internal: true

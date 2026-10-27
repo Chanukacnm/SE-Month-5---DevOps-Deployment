@@ -1,0 +1,4 @@
+# Every route except /login is behind authentication, so crawlers only ever see the sign-in page.
+# For a real deployment, consider `Disallow: /` plus an X-Robots-Tag: noindex header.
+User-agent: *
+Allow: /
