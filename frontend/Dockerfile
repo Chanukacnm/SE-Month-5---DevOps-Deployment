@@ -15,7 +15,7 @@ ENV VITE_API_URL=$VITE_API_URL
 RUN npm run build
 
 # ---- Runtime stage: static files behind nginx, running as a non-root user ----
-FROM nginxinc/nginx-unprivileged:1.30-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
 
 # Where nginx forwards /api requests. Overridden per environment
 # (http://backend:3000 in Compose, the API's URL in the cloud).
